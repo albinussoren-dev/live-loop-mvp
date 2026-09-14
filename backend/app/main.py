@@ -2,11 +2,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import uuid4
-import hmac, os, secrets, sqlite3, subprocess, sys, threading, time
+import os, secrets, sqlite3, subprocess, sys, threading, time
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
 from pydantic import BaseModel, Field
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
@@ -32,6 +34,12 @@ def now(): return datetime.now(timezone.utc)
 def iso(dt): return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def ensure_column(c, table, column, definition):
+    cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db():
     c = db()
     c.executescript("""
@@ -53,11 +61,12 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS streams (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      playlist_id TEXT REFERENCES playlists(id), title TEXT NOT NULL, loop INTEGER NOT NULL DEFAULT 1,
-      quality TEXT NOT NULL DEFAULT '1080p', status TEXT NOT NULL DEFAULT 'ready',
-      broadcast_id TEXT, stream_id TEXT, ingest_url TEXT, stream_key TEXT,
-      worker_pid INTEGER, restart_count INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL, started_at TEXT, stopped_at TEXT
+      playlist_id TEXT REFERENCES playlists(id), title TEXT NOT NULL, source_url TEXT,
+      loop INTEGER NOT NULL DEFAULT 1, quality TEXT NOT NULL DEFAULT '1080p',
+      status TEXT NOT NULL DEFAULT 'ready', broadcast_id TEXT, stream_id TEXT,
+      ingest_url TEXT, stream_key TEXT, worker_pid INTEGER,
+      restart_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+      started_at TEXT, stopped_at TEXT
     );
     CREATE TABLE IF NOT EXISTS logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT, stream_id TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
@@ -73,6 +82,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_logs_stream ON logs(stream_id,id DESC);
     CREATE INDEX IF NOT EXISTS idx_schedule_due ON schedules(enabled,next_run_at);
     """)
+    ensure_column(c, "streams", "source_url", "TEXT")
     c.commit(); c.close()
 
 
@@ -85,7 +95,8 @@ def dec(value: str) -> str:
     try:
         if not fernet: raise RuntimeError("ENCRYPTION_KEY is not configured")
         return fernet.decrypt(value.encode()).decode()
-    except InvalidToken as e: raise RuntimeError("Stored credential could not be decrypted") from e
+    except InvalidToken as e:
+        raise RuntimeError("Stored credential could not be decrypted") from e
 
 
 def log(sid, level, message):
@@ -105,13 +116,27 @@ def session_user(request: Request):
 def require_csrf(request: Request):
     if request.method in {"GET","HEAD","OPTIONS"}: return
     cookie=request.cookies.get("looplive_csrf"); header=request.headers.get("x-csrf-token")
-    # The custom header forces a CORS preflight. CORS is restricted to configured origins.
-    if cookie and header is not None: return
-    raise HTTPException(403,"CSRF validation failed")
+    if not cookie or not header or not secrets.compare_digest(cookie, header):
+        raise HTTPException(403,"CSRF validation failed")
 
 
 def token_pair(user):
-    return (dec(user["access_token"]) if user.get("access_token") else None), dec(user["refresh_token"])
+    access = dec(user["access_token"]) if user.get("access_token") else None
+    refresh = dec(user["refresh_token"])
+    expiry = None
+    if user.get("token_expiry"):
+        try: expiry = datetime.fromisoformat(user["token_expiry"].replace("Z", "+00:00"))
+        except ValueError: expiry = None
+    if access and refresh and expiry and expiry <= now():
+        credentials = Credentials(token=access, refresh_token=refresh,
+            token_uri="https://oauth2.googleapis.com/token", client_id=settings.google_client_id,
+            client_secret=settings.google_client_secret, scopes=YouTubeService.SCOPES if hasattr(YouTubeService, "SCOPES") else None, expiry=expiry)
+        credentials.refresh(GoogleRequest())
+        access = credentials.token
+        expiry = credentials.expiry
+        c=db(); c.execute("UPDATE users SET access_token=?,token_expiry=?,updated_at=? WHERE id=?",(enc(access),iso(expiry) if expiry else None,iso(now()),user["id"])); c.commit(); c.close()
+    return access, refresh
+
 
 class PlaylistCreate(BaseModel):
     name: str = Field(min_length=1,max_length=120)
@@ -145,10 +170,17 @@ async def lifespan(app: FastAPI):
             if p.poll() is None: p.terminate()
 
 app=FastAPI(title="LoopLive API",version="3.0.0",lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_credentials=True,allow_methods=["*"] ,allow_headers=["*"])
 
 @app.get("/health")
 def health(): return {"status":"ok","service":"looplive-api","version":app.version}
+
+@app.get("/api/auth/csrf")
+def csrf_token(request: Request, response: Response):
+    token = request.cookies.get("looplive_csrf") or secrets.token_urlsafe(32)
+    secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+    response.set_cookie("looplive_csrf", token, max_age=settings.session_max_age, httponly=False, secure=secure, samesite="none" if secure else "lax", path="/")
+    return {"token": token}
 
 @app.get("/api/auth/status")
 def auth_status(request: Request):
@@ -225,18 +257,22 @@ def create_stream(p:StreamCreate,request:Request):
     require_csrf(request); u=session_user(request); c=db(); n=c.execute("SELECT COUNT(*) n FROM streams WHERE user_id=? AND status IN ('starting','live')",(u["id"],)).fetchone()["n"]
     if n>=settings.max_streams_per_pilot: c.close(); raise HTTPException(409,"Active stream limit reached")
     if not p.playlist_id and not p.source_url: c.close(); raise HTTPException(400,"playlist_id or source_url is required")
-    sid="stream_"+secrets.token_hex(6); t=iso(now()); c.execute("INSERT INTO streams(id,user_id,playlist_id,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?)",(sid,u["id"],p.playlist_id,p.title,int(p.loop),p.quality,"ready",t)); c.commit(); c.close(); return {"id":sid,"title":p.title,"status":"ready"}
+    if p.playlist_id and p.source_url: c.close(); raise HTTPException(400,"Use playlist_id or source_url, not both")
+    if p.playlist_id:
+        owner=c.execute("SELECT id FROM playlists WHERE id=? AND user_id=?",(p.playlist_id,u["id"])).fetchone()
+        if not owner: c.close(); raise HTTPException(404,"Playlist not found")
+    sid="stream_"+secrets.token_hex(6); t=iso(now()); c.execute("INSERT INTO streams(id,user_id,playlist_id,source_url,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,u["id"],p.playlist_id,p.source_url,p.title,int(p.loop),p.quality,"ready",t)); c.commit(); c.close(); return {"id":sid,"title":p.title,"status":"ready"}
 
 def sources_for_stream(c,s):
     if s["playlist_id"]:
         rows=c.execute("SELECT source_uri FROM playlist_items WHERE playlist_id=? ORDER BY position,id",(s["playlist_id"],)).fetchall(); return [x["source_uri"] for x in rows]
-    return []
+    return [s["source_url"]] if s["source_url"] else []
 
 def do_start(sid,user_id):
     c=db(); s=c.execute("SELECT * FROM streams WHERE id=? AND user_id=?",(sid,user_id)).fetchone(); u=c.execute("SELECT * FROM users WHERE id=?",(user_id,)).fetchone(); c.close()
     if not s or not u: raise HTTPException(404,"Stream not found")
     c=db(); sources=sources_for_stream(c,s); c.close()
-    if not sources: raise HTTPException(400,"Playlist has no permitted media sources")
+    if not sources: raise HTTPException(400,"No permitted media source configured")
     access,refresh=token_pair(u); svc=YouTubeService(); b=svc.create_broadcast(access,s["title"]); st=svc.create_stream(access,s["title"],s["quality"]); svc.bind(access,b["id"],st["id"]); ing=st["cdn"]["ingestionInfo"]
     cmd=[sys.executable,"-m","app.worker","--stream-id",sid,"--source",",".join(sources),"--ingest",ing["ingestionAddress"],"--key",ing["streamName"]]
     if not s["loop"]: cmd.append("--no-loop")
@@ -317,7 +353,7 @@ def scheduler_loop():
                 try:
                     uid=s["user_id"]; c2=db(); n=c2.execute("SELECT COUNT(*) n FROM streams WHERE user_id=? AND status IN ('starting','live')",(uid,)).fetchone()["n"]
                     if n<settings.max_streams_per_pilot:
-                        sid="stream_"+secrets.token_hex(6); t=iso(now()); c2.execute("INSERT INTO streams(id,user_id,playlist_id,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?)",(sid,uid,s["playlist_id"],s["title"],1,"1080p","ready",t)); c2.commit(); c2.close(); do_start(sid,uid)
+                        sid="stream_"+secrets.token_hex(6); t=iso(now()); c2.execute("INSERT INTO streams(id,user_id,playlist_id,source_url,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,uid,s["playlist_id"],None,s["title"],1,"1080p","ready",t)); c2.commit(); c2.close(); do_start(sid,uid)
                     else: c2.close()
                 except Exception as e: print("schedule run failed",e)
             c.close()
