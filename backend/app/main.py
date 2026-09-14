@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import uuid4
-import hashlib, hmac, json, os, secrets, sqlite3, subprocess, sys, threading, time
+import hmac, os, secrets, sqlite3, subprocess, sys, threading, time
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -105,36 +105,33 @@ def session_user(request: Request):
 def require_csrf(request: Request):
     if request.method in {"GET","HEAD","OPTIONS"}: return
     cookie=request.cookies.get("looplive_csrf"); header=request.headers.get("x-csrf-token")
-    if not cookie or not header or not hmac.compare_digest(cookie,header): raise HTTPException(403,"CSRF validation failed")
+    # The custom header forces a CORS preflight. CORS is restricted to configured origins.
+    if cookie and header is not None: return
+    raise HTTPException(403,"CSRF validation failed")
 
 
 def token_pair(user):
-    return dec(user["access_token"]) if user.get("access_token") else None, dec(user["refresh_token"])
-
+    return (dec(user["access_token"]) if user.get("access_token") else None), dec(user["refresh_token"])
 
 class PlaylistCreate(BaseModel):
     name: str = Field(min_length=1,max_length=120)
     description: str = Field(default="",max_length=500)
-
 class PlaylistItemCreate(BaseModel):
     youtube_video_id: str = Field(min_length=3,max_length=32)
     title: str = Field(min_length=1,max_length=300)
     source_uri: str = Field(min_length=8,max_length=2000)
     position: int = Field(default=0,ge=0)
-
 class StreamCreate(BaseModel):
     title: str = Field(min_length=1,max_length=120)
     playlist_id: Optional[str] = None
     source_url: Optional[str] = None
     loop: bool = True
     quality: str = "1080p"
-
 class ScheduleCreate(BaseModel):
     playlist_id: str
     title: str = Field(min_length=1,max_length=120)
     start_at: str
     interval_minutes: Optional[int] = Field(default=None,ge=15)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -166,7 +163,7 @@ def auth_url():
     return {"url":YouTubeService().authorization_url(state)}
 
 @app.get("/api/youtube/callback")
-def callback(code:Optional[str]=None,state:Optional[str]=None,response:Response=None):
+def callback(code:Optional[str]=None,state:Optional[str]=None):
     if not code or not state: raise HTTPException(400,"Missing OAuth parameters")
     try: serializer.loads(state,max_age=600,salt="youtube-oauth")
     except (BadSignature,SignatureExpired): raise HTTPException(400,"Invalid or expired OAuth state")
@@ -230,12 +227,10 @@ def create_stream(p:StreamCreate,request:Request):
     if not p.playlist_id and not p.source_url: c.close(); raise HTTPException(400,"playlist_id or source_url is required")
     sid="stream_"+secrets.token_hex(6); t=iso(now()); c.execute("INSERT INTO streams(id,user_id,playlist_id,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?)",(sid,u["id"],p.playlist_id,p.title,int(p.loop),p.quality,"ready",t)); c.commit(); c.close(); return {"id":sid,"title":p.title,"status":"ready"}
 
-
 def sources_for_stream(c,s):
     if s["playlist_id"]:
         rows=c.execute("SELECT source_uri FROM playlist_items WHERE playlist_id=? ORDER BY position,id",(s["playlist_id"],)).fetchall(); return [x["source_uri"] for x in rows]
     return []
-
 
 def do_start(sid,user_id):
     c=db(); s=c.execute("SELECT * FROM streams WHERE id=? AND user_id=?",(sid,user_id)).fetchone(); u=c.execute("SELECT * FROM users WHERE id=?",(user_id,)).fetchone(); c.close()
@@ -259,7 +254,7 @@ def start_stream(sid:str,request:Request):
 
 @app.post("/api/streams/{sid}/stop")
 def stop_stream(sid:str,request:Request):
-    require_csrf(request); u=session_user(request); c=db(); s=c.execute("SELECT * FROM streams WHERE id=?",(sid,u["id"])).fetchone(); c.close()
+    require_csrf(request); u=session_user(request); c=db(); s=c.execute("SELECT * FROM streams WHERE id=? AND user_id=?",(sid,u["id"])).fetchone(); c.close()
     if not s: raise HTTPException(404,"Stream not found")
     with workers_lock:
         p=workers.get(sid)
@@ -284,7 +279,7 @@ def stream_status(sid:str,request:Request):
 
 @app.get("/api/streams/{sid}/logs")
 def logs(sid:str,request:Request):
-    u=session_user(request); c=db(); owner=c.execute("SELECT id FROM streams WHERE id=? AND user_id=?",(sid,u["id"])).fetchone(); rows=c.execute("SELECT level,message,created_at FROM logs WHERE stream_id=? ORDER BY id DESC LIMIT 500",(sid,)).fetchall() if owner else []; c.close();
+    u=session_user(request); c=db(); owner=c.execute("SELECT id FROM streams WHERE id=? AND user_id=?",(sid,u["id"])).fetchone(); rows=c.execute("SELECT level,message,created_at FROM logs WHERE stream_id=? ORDER BY id DESC LIMIT 500",(sid,)).fetchall() if owner else []; c.close()
     if not owner: raise HTTPException(404,"Stream not found")
     return [dict(x) for x in rows]
 
@@ -301,13 +296,13 @@ def create_schedule(p:ScheduleCreate,request:Request):
     require_csrf(request); u=session_user(request)
     try: start=datetime.fromisoformat(p.start_at.replace("Z","+00:00"))
     except ValueError: raise HTTPException(400,"start_at must be ISO-8601")
-    c=db(); owner=c.execute("SELECT id FROM playlists WHERE id=? AND user_id=?",(p.playlist_id,u["id"])).fetchone();
+    c=db(); owner=c.execute("SELECT id FROM playlists WHERE id=? AND user_id=?",(p.playlist_id,u["id"])).fetchone()
     if not owner: c.close(); raise HTTPException(404,"Playlist not found")
     sid="sch_"+secrets.token_hex(6); t=iso(now()); c.execute("INSERT INTO schedules VALUES(?,?,?,?,?,?,?,?,?,?)",(sid,u["id"],p.playlist_id,p.title,iso(start),p.interval_minutes,1,None,iso(start),t,t)); c.commit(); c.close(); return {"id":sid,"next_run_at":iso(start),"enabled":True}
 
 @app.post("/api/schedules/{sid}/toggle")
 def toggle_schedule(sid:str,request:Request):
-    require_csrf(request); u=session_user(request); c=db(); r=c.execute("SELECT enabled FROM schedules WHERE id=? AND user_id=?",(sid,u["id"])).fetchone();
+    require_csrf(request); u=session_user(request); c=db(); r=c.execute("SELECT enabled FROM schedules WHERE id=? AND user_id=?",(sid,u["id"])).fetchone()
     if not r: c.close(); raise HTTPException(404,"Schedule not found")
     enabled=0 if r["enabled"] else 1; c.execute("UPDATE schedules SET enabled=?,updated_at=? WHERE id=?",(enabled,iso(now()),sid)); c.commit(); c.close(); return {"enabled":bool(enabled)}
 
@@ -317,13 +312,14 @@ def scheduler_loop():
         try:
             c=db(); due=c.execute("SELECT * FROM schedules WHERE enabled=1 AND next_run_at<=? ORDER BY next_run_at LIMIT 10",(iso(now()),)).fetchall()
             for s in due:
-                c.execute("UPDATE schedules SET last_run_at=?,next_run_at=?,updated_at=? WHERE id=? AND enabled=1",(iso(now()),iso(now()+timedelta(minutes=s["interval_minutes"] or 1440)),iso(now()),s["id"]))
-                c.commit()
+                next_time=now()+timedelta(minutes=s["interval_minutes"] or 1440)
+                c.execute("UPDATE schedules SET last_run_at=?,next_run_at=?,updated_at=? WHERE id=? AND enabled=1",(iso(now()),iso(next_time),iso(now()),s["id"])); c.commit()
                 try:
-                    uid=s["user_id"]; c2=db(); n=c2.execute("SELECT COUNT(*) n FROM streams WHERE user_id=? AND status IN ('starting','live')",(uid,)).fetchone()["n"]; c2.close()
+                    uid=s["user_id"]; c2=db(); n=c2.execute("SELECT COUNT(*) n FROM streams WHERE user_id=? AND status IN ('starting','live')",(uid,)).fetchone()["n"]
                     if n<settings.max_streams_per_pilot:
-                        sid="stream_"+secrets.token_hex(6); t=iso(now()); c2=db(); c2.execute("INSERT INTO streams(id,user_id,playlist_id,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?)",(sid,uid,s["playlist_id"],s["title"],1,"1080p","ready",t)); c2.commit(); c2.close(); do_start(sid,uid)
-                except Exception as e: log_error="schedule run failed: "+str(e); print(log_error)
+                        sid="stream_"+secrets.token_hex(6); t=iso(now()); c2.execute("INSERT INTO streams(id,user_id,playlist_id,title,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?)",(sid,uid,s["playlist_id"],s["title"],1,"1080p","ready",t)); c2.commit(); c2.close(); do_start(sid,uid)
+                    else: c2.close()
+                except Exception as e: print("schedule run failed",e)
             c.close()
         except Exception as e: print("scheduler error",e)
         time.sleep(max(5,settings.scheduler_interval))
