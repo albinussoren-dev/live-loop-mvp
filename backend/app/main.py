@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .settings import settings
-from .youtube import YouTubeService
+from .youtube import YouTubeService, SCOPES
 
 DB = settings.database_url.replace("sqlite:///", "") if settings.database_url.startswith("sqlite:///") else "looplive.db"
 serializer = URLSafeTimedSerializer(settings.session_secret or "dev-only-change-me")
@@ -130,7 +130,7 @@ def token_pair(user):
     if access and refresh and expiry and expiry <= now():
         credentials = Credentials(token=access, refresh_token=refresh,
             token_uri="https://oauth2.googleapis.com/token", client_id=settings.google_client_id,
-            client_secret=settings.google_client_secret, scopes=YouTubeService.SCOPES if hasattr(YouTubeService, "SCOPES") else None, expiry=expiry)
+            client_secret=settings.google_client_secret, scopes=SCOPES, expiry=expiry)
         credentials.refresh(GoogleRequest())
         access = credentials.token
         expiry = credentials.expiry
@@ -170,7 +170,7 @@ async def lifespan(app: FastAPI):
             if p.poll() is None: p.terminate()
 
 app=FastAPI(title="LoopLive API",version="3.0.0",lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_credentials=True,allow_methods=["*"] ,allow_headers=["*"])
+app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
 @app.get("/health")
 def health(): return {"status":"ok","service":"looplive-api","version":app.version}
