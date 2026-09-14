@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+.env
+.env.*
+!.env.example
+*.log
+backend/.venv/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+looplive.db
+*.pyc
+.DS_Store
