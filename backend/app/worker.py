@@ -11,8 +11,8 @@ def run_stream(sid,sources,ingest,key,loop=True):
    for u in urls:f.write("file '"+u.replace("'","'\\''")+"'\n")
    f.close()
   while True:
-   inp=['-f','concat','-safe','0','-protocol_whitelist','file,http,https,tcp,tls','-i',concat] if concat else ['-i',urls[0]]
-   cmd=['ffmpeg','-hide_banner','-loglevel','warning','-re']+(['-stream_loop','-1'] if loop and not concat else [])+inp+['-c:v','libx264','-preset','veryfast','-tune','zerolatency','-b:v','4500k','-maxrate','4500k','-bufsize','9000k','-pix_fmt','yuv420p','-r','30','-g','60','-c:a','aac','-b:a','128k','-ar','44100','-f','flv',f'{ingest}/{key}']
+   inp=(['-stream_loop','-1'] if loop else [])+(['-f','concat','-safe','0','-protocol_whitelist','file,http,https,tcp,tls','-i',concat] if concat else ['-i',urls[0]])
+   cmd=['ffmpeg','-hide_banner','-loglevel','warning','-re']+inp+['-c:v','libx264','-preset','veryfast','-tune','zerolatency','-b:v','4500k','-maxrate','4500k','-bufsize','9000k','-pix_fmt','yuv420p','-r','30','-g','60','-c:a','aac','-b:a','128k','-ar','44100','-f','flv',f'{ingest}/{key}']
    log(sid,'info',f'FFmpeg started with {len(urls)} source(s)'); p=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
    for line in p.stderr:
     if line.strip(): log(sid,'info',line.strip()[-1000:])
