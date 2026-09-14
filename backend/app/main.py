@@ -1,124 +1,97 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
-
+import sqlite3, secrets
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from .settings import settings
 from .youtube import YouTubeService
 
-streams: dict[str, dict] = {}
+DB=settings.database_url.replace("sqlite:///","") if settings.database_url.startswith("sqlite:///") else "looplive.db"
 
+def db():
+ c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+
+def init_db():
+ c=db(); c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT,channel_id TEXT,channel_title TEXT,access_token TEXT,refresh_token TEXT,created_at TEXT); CREATE TABLE IF NOT EXISTS streams(id TEXT PRIMARY KEY,user_id TEXT,title TEXT,video_id TEXT,source_url TEXT,loop INTEGER,quality TEXT,status TEXT,broadcast_id TEXT,stream_id TEXT,ingest_url TEXT,stream_key TEXT,created_at TEXT,started_at TEXT,stopped_at TEXT); CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,stream_id TEXT,level TEXT,message TEXT,created_at TEXT);'''); c.commit(); c.close()
+
+def log(stream_id,level,message):
+ c=db(); c.execute("INSERT INTO logs(stream_id,level,message,created_at) VALUES(?,?,?,?)",(stream_id,level,message,datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
 
 class StreamCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
-    video_id: str = Field(min_length=3, max_length=32)
-    loop: bool = True
-    quality: str = "1080p"
-    youtube_channel_id: Optional[str] = None
-
-
-class StreamOut(StreamCreate):
-    id: str
-    status: str
-    youtube_broadcast_id: Optional[str] = None
-    youtube_stream_id: Optional[str] = None
-
+ title:str=Field(min_length=1,max_length=120); video_id:str=Field(min_length=3,max_length=32); source_url:Optional[str]=None; loop:bool=True; quality:str="1080p"
+class StreamOut(BaseModel):
+ id:str; title:str; video_id:str; source_url:Optional[str]; loop:bool; quality:str; status:str; youtube_broadcast_id:Optional[str]=None; youtube_stream_id:Optional[str]=None; started_at:Optional[str]=None
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
+async def lifespan(app:FastAPI): init_db(); yield
+app=FastAPI(title="LoopLive API",version="2.0.0",lifespan=lifespan)
+app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
+def token_or_401():
+ c=db(); r=c.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 1").fetchone(); c.close()
+ if not r: raise HTTPException(401,"Connect Google/YouTube first")
+ return dict(r)
 
-app = FastAPI(title="LoopLive API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-def get_stream_or_404(stream_id: str) -> dict:
-    stream = streams.get(stream_id)
-    if not stream:
-        raise HTTPException(status_code=404, detail="Stream not found")
-    return stream
-
+def row_stream(r): return StreamOut(id=r["id"],title=r["title"],video_id=r["video_id"],source_url=r["source_url"],loop=bool(r["loop"]),quality=r["quality"],status=r["status"],youtube_broadcast_id=r["broadcast_id"],youtube_stream_id=r["stream_id"],started_at=r["started_at"])
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "service": "looplive-api", "version": app.version}
-
-
-@app.get("/api/streams", response_model=list[StreamOut])
-def list_streams():
-    return list(streams.values())
-
-
-@app.post("/api/streams", response_model=StreamOut, status_code=201)
-def create_stream(payload: StreamCreate):
-    if len(streams) >= settings.max_streams_per_pilot:
-        raise HTTPException(status_code=409, detail="Pilot stream limit reached")
-    stream_id = f"stream_{uuid4().hex[:10]}"
-    stream = {"id": stream_id, "status": "ready", "youtube_broadcast_id": None, "youtube_stream_id": None, **payload.model_dump()}
-    streams[stream_id] = stream
-    return stream
-
-
-@app.post("/api/streams/{stream_id}/start", response_model=StreamOut)
-def start_stream(stream_id: str):
-    stream = get_stream_or_404(stream_id)
-    if stream["status"] == "live":
-        return stream
-    stream["status"] = "starting"
-    # A worker should consume this job and publish the authorized media source to YouTube RTMP.
-    stream["status"] = "ready_to_publish"
-    return stream
-
-
-@app.post("/api/streams/{stream_id}/stop", response_model=StreamOut)
-def stop_stream(stream_id: str):
-    stream = get_stream_or_404(stream_id)
-    stream["status"] = "stopped"
-    return stream
-
-
-@app.get("/api/youtube/config")
-def youtube_config():
-    return {"configured": settings.youtube_configured, "redirect_uri": settings.youtube_redirect_uri}
-
+def health(): return {"status":"ok","service":"looplive-api","version":app.version}
 
 @app.get("/api/youtube/auth-url")
-def youtube_auth_url(state: str = Query(default="looplive")):
-    service = YouTubeService()
-    if not settings.youtube_configured:
-        raise HTTPException(status_code=503, detail="Configure Google OAuth credentials first")
-    return {"url": service.authorization_url(state)}
-
+def auth_url(state:str="looplive"):
+ if not settings.youtube_configured: raise HTTPException(503,"Configure Google OAuth credentials")
+ return {"url":YouTubeService().authorization_url(state)}
 
 @app.get("/api/youtube/callback")
-def youtube_callback(code: Optional[str] = None, state: Optional[str] = None):
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing OAuth authorization code")
-    if not settings.youtube_configured:
-        raise HTTPException(status_code=503, detail="Configure Google OAuth credentials first")
-    service = YouTubeService()
-    tokens = service.exchange_code(code)
-    # Store tokens encrypted in a real database/secret store. Never expose refresh tokens to the browser.
-    return {"connected": True, "state": state, "token_type": tokens.get("token_type", "Bearer")}
+def callback(code:Optional[str]=None,state:Optional[str]=None):
+ if not code: raise HTTPException(400,"Missing OAuth code")
+ cred=YouTubeService().exchange_code(code); svc=YouTubeService(); ch=svc.channel(cred.token,cred.refresh_token)
+ if not ch: raise HTTPException(400,"No YouTube channel found")
+ c=db(); c.execute("DELETE FROM users"); uid=uuid4().hex; c.execute("INSERT INTO users(id,email,channel_id,channel_title,access_token,refresh_token,created_at) VALUES(?,?,?,?,?,?,?)",(uid,None,ch["id"],ch["snippet"]["title"],cred.token,cred.refresh_token,datetime.now(timezone.utc).isoformat())); c.commit(); c.close()
+ return {"connected":True,"channel":{"id":ch["id"],"title":ch["snippet"]["title"]},"state":state}
 
+@app.get("/api/youtube/channel")
+def channel():
+ u=token_or_401(); return {"id":u["channel_id"],"title":u["channel_title"]}
 
 @app.get("/api/youtube/videos")
-def youtube_videos(channel_id: Optional[str] = None):
-    if not settings.youtube_configured:
-        return {"items": [], "configured": False, "message": "Configure Google OAuth credentials to load authorized videos."}
-    return {"items": [], "configured": True, "channel_id": channel_id, "message": "Connect a user token and query the YouTube Data API for that authorized channel."}
+def videos():
+ u=token_or_401(); return {"items":YouTubeService().videos(u["access_token"],u["refresh_token"])}
 
+@app.post("/api/streams",response_model=StreamOut,status_code=201)
+def create_stream(p:StreamCreate):
+ u=token_or_401(); c=db(); n=c.execute("SELECT COUNT(*) n FROM streams WHERE status IN ('starting','live')").fetchone()["n"]
+ if n>=settings.max_streams_per_pilot: c.close(); raise HTTPException(409,"Pilot stream limit reached")
+ sid="stream_"+secrets.token_hex(5); c.execute("INSERT INTO streams(id,user_id,title,video_id,source_url,loop,quality,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(sid,u["id"],p.title,p.video_id,p.source_url,int(p.loop),p.quality,"ready",datetime.now(timezone.utc).isoformat())); c.commit(); r=c.execute("SELECT * FROM streams WHERE id=?",(sid,)).fetchone(); c.close(); return row_stream(r)
 
-@app.get("/api/youtube/live/health")
-def youtube_live_health():
-    return {"configured": settings.youtube_configured, "live_api": settings.youtube_configured, "message": "YouTube Live API is ready for credentialed integration."}
+@app.get("/api/streams",response_model=list[StreamOut])
+def streams():
+ c=db(); r=c.execute("SELECT * FROM streams ORDER BY created_at DESC").fetchall(); c.close(); return [row_stream(x) for x in r]
+
+@app.post("/api/streams/{sid}/start",response_model=StreamOut)
+def start(sid:str):
+ u=token_or_401(); c=db(); r=c.execute("SELECT * FROM streams WHERE id=?",(sid,)).fetchone(); c.close()
+ if not r: raise HTTPException(404,"Stream not found")
+ if not r["source_url"]: raise HTTPException(400,"source_url is required. YouTube video IDs identify metadata but are not downloadable media URLs; use your authorized source file or signed storage URL.")
+ svc=YouTubeService(); b=svc.create_broadcast(u["access_token"],r["title"]); s=svc.create_stream(u["access_token"],r["title"],r["quality"]); svc.bind(u["access_token"],b["id"],s["id"]); ing=s["cdn"]["ingestionInfo"]
+ c=db(); c.execute("UPDATE streams SET status='starting',broadcast_id=?,stream_id=?,ingest_url=?,stream_key=? WHERE id=?",(b["id"],s["id"],ing["ingestionAddress"],ing["streamName"],sid)); c.commit(); rr=c.execute("SELECT * FROM streams WHERE id=?",(sid,)).fetchone(); c.close(); log(sid,"info","YouTube broadcast and RTMP stream created"); return row_stream(rr)
+
+@app.post("/api/streams/{sid}/stop",response_model=StreamOut)
+def stop(sid:str):
+ u=token_or_401(); c=db(); r=c.execute("SELECT * FROM streams WHERE id=?",(sid,)).fetchone(); c.close()
+ if not r: raise HTTPException(404,"Stream not found")
+ if r["broadcast_id"]:
+  try: YouTubeService().transition(u["access_token"],r["broadcast_id"],"complete")
+  except Exception as e: log(sid,"warn",f"YouTube transition failed: {e}")
+ c=db(); now=datetime.now(timezone.utc).isoformat(); c.execute("UPDATE streams SET status='stopped',stopped_at=? WHERE id=?",(now,sid)); c.commit(); rr=c.execute("SELECT * FROM streams WHERE id=?",(sid,)).fetchone(); c.close(); log(sid,"info","Stream stopped"); return row_stream(rr)
+
+@app.get("/api/streams/{sid}/logs")
+def logs(sid:str):
+ c=db(); r=c.execute("SELECT level,message,created_at FROM logs WHERE stream_id=? ORDER BY id DESC LIMIT 200",(sid,)).fetchall(); c.close(); return [dict(x) for x in r]
+
+@app.get("/api/analytics")
+def analytics():
+ c=db(); total=c.execute("SELECT COUNT(*) n FROM streams").fetchone()["n"]; live=c.execute("SELECT COUNT(*) n FROM streams WHERE status IN ('starting','live')").fetchone()["n"]; events=c.execute("SELECT COUNT(*) n FROM logs").fetchone()["n"]; c.close(); return {"streams_total":total,"active_streams":live,"log_events":events}
